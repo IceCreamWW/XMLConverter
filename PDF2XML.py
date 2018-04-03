@@ -1,5 +1,6 @@
 import os, shutil
 from pdf2image import convert_from_path
+import pytesseract
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
@@ -20,8 +21,6 @@ class ImageConverter():
 
 
 	def sharpen(self):
-		print(np.max(self.S))		
-		print(np.min(self.S))	
 		S = (self.S.astype(int) - 100) > 0
 		V = (self.V.astype(int) - 100) > 0
 
@@ -60,6 +59,56 @@ class ImageConverter():
 		self.H, self.S, self.V = cv2.split(self.HSV)
 		return self.HSV
 
+	def get_segments(self):
+		raise NotImplementedError()
+
+	def mark_titles(self):
+		width = self.HSV.shape[1]
+		self.rectangles = []
+		for segment in self.segments:
+			left_bound = right_bound = -1
+
+			border_noise_drop = int((segment[1] - segment[0]) / 8)
+			new_seg = (segment[0] + border_noise_drop, segment[1] - border_noise_drop)
+			
+			stds = [np.std(self.S[new_seg[0]:new_seg[1],i]) for i in range(width)]
+			aver_std = np.mean([std for std in stds if std > 1])
+
+			for i in range(0, width):
+				if left_bound == -1 and np.std(self.S[new_seg[0]:new_seg[1],i]) > aver_std * 0.3:
+					left_bound = i
+				if right_bound == -1 and np.std(self.S[new_seg[0]:new_seg[1],width - i - 1]) > aver_std * 0.3:
+					right_bound = width - i - 1
+				if left_bound != -1 and right_bound != -1:
+					break
+			self.rectangles.append((new_seg[0], left_bound, new_seg[1], right_bound))
+
+		base_index = len(os.listdir(self.output_folder))
+		title_imgs = []
+
+		rectangle_widths = [rectangle[3] - rectangle[1] for rectangle in self.rectangles]
+		aver_width = (np.sum(rectangle_widths) - np.max(rectangle_widths) - np.min(rectangle_widths)) / (len(rectangle_widths) - 2)
+		max_width = aver_width * 3
+		min_width = aver_width / 3
+		self.rectangles = [rectangle for rectangle in self.rectangles if (rectangle[3] - rectangle[1]) > min_width and (rectangle[3] - rectangle[1]) < max_width]
+		for index, rectangle in enumerate(self.rectangles):
+			word_img = cv2.cvtColor(self.HSV[rectangle[0]:rectangle[2], rectangle[1]:rectangle[3]], cv2.COLOR_HSV2RGB)
+			word_img_gray = cv2.cvtColor(word_img, cv2.COLOR_BGR2GRAY)
+			title_imgs.append(word_img_gray)
+			cv2.imwrite(os.path.join(self.output_folder, "%d.jpg" % (base_index + index + 1)), word_img_gray)
+			# print(rectangle)
+			cv2.rectangle(self.HSV, (rectangle[1], rectangle[0]), (rectangle[3], rectangle[2]), (0x0,0xFF,0xFF), 5)
+
+		for title_img in title_imgs:
+			print(pytesseract.image_to_string(title_img, lang="chi_sim"))
+
+		return self.HSV
+
+
+class ColorBasedConverter(ImageConverter):
+	def __init__(self, img_path, output_folder):
+		ImageConverter.__init__(self, img_path, output_folder)
+
 	def __get_segments__(self):
 		start = -1
 		cnt = 1
@@ -73,28 +122,34 @@ class ImageConverter():
 				cnt += 1
 				start = -1
 
-		if len(segments <= 2):
+		if len(segments) <= 2:
 			raise ValueError("Image cannot be converted through color features")
 
 		segment_heights = [segment[2] for segment in segments]
+		counts = np.bincount(segment_heights)
+		mode = np.argmax(counts)
+		if np.max(counts) >= int(0.6 * (len(segment_heights))):
+			segments = [segment for segment in segments if segment[2] == mode]
+			return (True, segments, self.HSV)
+
 		aver_height = (np.sum(segment_heights) - np.max(segment_heights) - np.min(segment_heights)) / (len(segment_heights) - 2)
-		
 		max_height = aver_height * 3
 		min_height = aver_height / 3
-
-		min_dropped_segments = [segment for segment in segments if segment[2] < min_height]
-		max_dropped_segments = [segment for segment in segments if segment[2] > max_height]
+		min_height_dropped_segments = [segment for segment in segments if segment[2] < min_height]
+		max_height_dropped_segments = [segment for segment in segments if segment[2] > max_height]
 		
 		# print to see what segments do you have
-		# print(segments)
+		# for segment in segments:
+			# print(segment)
 		# print(min_dropped_segments)
 		# print(max_dropped_segments)
-
+		max_dropped_segments = [segment for segment in segments if segment[2] >= max_height]
+		min_dropped_segments = [segment for segment in segments if segment[2] <= min_height]
 		segments = [segment for segment in segments if segment[2] <= max_height and segment[2] >= min_height]
 
 		self.std_height = np.mean([segment[2] for segment in segments])
 
-		for segment in min_dropped_segments:
+		for segment in min_height_dropped_segments:
 			self.HSV[segment[0]:segment[1],:] = [0,0,255]
 
 		# reserved code for inline image elimination
@@ -120,33 +175,13 @@ class ImageConverter():
 			done, self.segments, HSV = self.__get_segments__()
 		return (self.segments, HSV)
 
-	def mark_titles(self):
-		width = self.HSV.shape[1]
-		self.rectangles = []
-		for segment in self.segments:
-			left_bound = right_bound = -1
+class FontBasedConverter(ImageConverter):
+	def __init__(self, img_path, output_folder):
+		ImageConverter.__init__(self, img_path, output_folder)
 
-			border_noise_drop = int((segment[1] - segment[0]) / 8)
-			new_seg = (segment[0] + border_noise_drop, segment[1] - border_noise_drop)
-			
-			stds = [np.std(self.V[new_seg[0]:new_seg[1],i]) for i in range(width)]
-			aver_std = np.mean([std for std in stds if std > 1])
+	def get_segments(self):
+		raise NotImplementedError()
 
-			for i in range(0, width):
-				if left_bound == -1 and np.std(self.V[new_seg[0]:new_seg[1],i]) > aver_std * 0.5 and np.count_nonzero(self.V[new_seg[0]:new_seg[1],i]) > self.std_height / 2:
-					left_bound = i
-				if right_bound == -1 and np.std(self.V[new_seg[0]:new_seg[1],width - i - 1]) > aver_std * 0.5 and np.count_nonzero(self.V[new_seg[0]:new_seg[1],width - i - 1]) > self.std_height / 2:
-					right_bound = width - i - 1
-				if left_bound != -1 and right_bound != -1:
-					break
-			self.rectangles.append((new_seg[0], left_bound, new_seg[1], right_bound))
-
-		base_index = len(os.listdir(output_folder))
-		for index, rectangle in enumerate(self.rectangles):
-			word_img = cv2.cvtColor(HSV[rectangle[0]:rectangle[2], rectangle[1]:rectangle[3]], cv2.COLOR_HSV2BGR)
-			cv2.imwrite(os.path.join(self.output_folder, "%d.jpg" % (base_index + index + 1)), word_img)
-			cv2.rectangle(HSV, (rectangle[0], rectangle[1]), (rectangle[2], rectangle[3]), (0x0,0xFF,0xFF), 1)
-		return HSV
 
 
 class PDF2XML():
@@ -173,10 +208,10 @@ class PDF2XML():
 				os.path.join(self.work_dirs["pdf_images_dir"], "%d.jpg" % (index + 1)))
 
 if __name__ == '__main__':
-	dealer = Image2XML(".\\pictures\\2-1.jpg", ".\\XM\\images\\words_images")
+	dealer = ColorBasedConverter(".\\pictures\\1.jpg", ".\\XM\\images\\words_images")
 
-	HSV = dealer.sharpen()
 	HSV = dealer.clear_tableline()
+	HSV = dealer.sharpen()
 	segments, HSV = dealer.get_segments()
 	HSV = dealer.mark_titles()
 
