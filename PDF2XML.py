@@ -68,20 +68,18 @@ class ImageConverter():
 		for segment in self.segments:
 			left_bound = right_bound = -1
 
-			border_noise_drop = int((segment[1] - segment[0]) / 8)
-			new_seg = (segment[0] + border_noise_drop, segment[1] - border_noise_drop)
 			
-			stds = [np.std(self.S[new_seg[0]:new_seg[1],i]) for i in range(width)]
+			stds = [np.std(self.S[segment[0]:segment[1],i]) for i in range(width)]
 			aver_std = np.mean([std for std in stds if std > 1])
 
 			for i in range(0, width):
-				if left_bound == -1 and np.std(self.S[new_seg[0]:new_seg[1],i]) > aver_std * 0.3:
+				if left_bound == -1 and np.std(self.S[segment[0]:segment[1],i]) > aver_std * 0.3:
 					left_bound = i
-				if right_bound == -1 and np.std(self.S[new_seg[0]:new_seg[1],width - i - 1]) > aver_std * 0.3:
+				if right_bound == -1 and np.std(self.S[segment[0]:segment[1],width - i - 1]) > aver_std * 0.3:
 					right_bound = width - i - 1
 				if left_bound != -1 and right_bound != -1:
 					break
-			self.rectangles.append((new_seg[0], left_bound, new_seg[1], right_bound))
+			self.rectangles.append((segment[0], left_bound, segment[1], right_bound))
 
 		base_index = len(os.listdir(self.output_folder))
 		title_imgs = []
@@ -91,18 +89,68 @@ class ImageConverter():
 		max_width = aver_width * 3
 		min_width = aver_width / 3
 		self.rectangles = [rectangle for rectangle in self.rectangles if (rectangle[3] - rectangle[1]) > min_width and (rectangle[3] - rectangle[1]) < max_width]
+
 		for index, rectangle in enumerate(self.rectangles):
-			word_img = cv2.cvtColor(self.HSV[rectangle[0]:rectangle[2], rectangle[1]:rectangle[3]], cv2.COLOR_HSV2RGB)
-			word_img_gray = cv2.cvtColor(word_img, cv2.COLOR_BGR2GRAY)
-			title_imgs.append(word_img_gray)
-			cv2.imwrite(os.path.join(self.output_folder, "%d.jpg" % (base_index + index + 1)), word_img_gray)
+			# hsv_img = self.HSV[rectangle[0]:rectangle[2], rectangle[1]:rectangle[3]]
+			# rgb_img = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2RGB)
+
+			hsv_img = self.standarize_word_img(self.HSV[rectangle[0]:rectangle[2], rectangle[1]:rectangle[3]])
+			rgb_img = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2RGB)
+			cv2.imwrite(os.path.join(self.output_folder, "%d.jpg" % (base_index + index + 1)), rgb_img)
+			# grayscale_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2GRAY)
+			title_imgs.append(cv2.cvtColor(rgb_img, cv2.COLOR_BGR2GRAY))
+			# cv2.imwrite(os.path.join(self.output_folder, "%d.jpg" % (base_index + index + 1)), grayscale_img)
 			# print(rectangle)
-			cv2.rectangle(self.HSV, (rectangle[1], rectangle[0]), (rectangle[3], rectangle[2]), (0x0,0xFF,0xFF), 5)
+			cv2.rectangle(self.HSV, (rectangle[1], rectangle[0]), (rectangle[3], rectangle[2]), (0x0,0xFF,0xFF), 1)
 
 		for title_img in title_imgs:
 			print(pytesseract.image_to_string(title_img, lang="chi_sim"))
 
 		return self.HSV
+
+	def standarize_word_img(self, hsv):
+		bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+		gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+		bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+		hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+		h,s,v = cv2.split(hsv)
+		# Reverse color and binaryzation 
+		aver = np.mean(v)
+		v_bg = (v.astype('int') - int(aver) > 0).astype(int)
+
+		if np.sum(v_bg[0:4,0:4].astype(int)) <= 4:
+			v = ((1 - v_bg) * 255).astype("uint8")
+		else:
+			v = (v_bg * 255).astype("uint8")
+
+		hsv = cv2.merge((h,s,v))
+
+		# reserved code for optimization
+		# column segments
+		# segments = []
+		# start = -1
+		# for index, column in enumerate(np.transpose(v)):
+		# 	# print(column)
+		# 	is_blank = (column == 255).all()
+		# 	if start == -1 and not is_blank:
+		# 		start = index
+		# 	elif start != -1 and is_blank:
+		# 		segments.append((start, index))
+		# 		start = -1
+		
+		# if start != -1:
+		# 	segments.append((start,v.shape[1]))
+
+		# widths = np.array([(segment[1] - segment[0]) for segment in segments])
+		# widths = widths[abs(widths - np.mean(widths)) < 2 * np.std(widths)]
+		# dropped_segments = [segment for segment in segments if (segment[1] - segment[0]) not in widths]
+		# for segment in dropped_segments:
+		# 	hsv[:, segment[0]:segment[1]] = [0,0,255]			
+
+		return hsv
+
+
 
 
 class ColorBasedConverter(ImageConverter):
@@ -138,7 +186,7 @@ class ColorBasedConverter(ImageConverter):
 		min_height_dropped_segments = [segment for segment in segments if segment[2] < min_height]
 		max_height_dropped_segments = [segment for segment in segments if segment[2] > max_height]
 		
-		# print to see what segments do you have
+		# print to see segments you have
 		# for segment in segments:
 			# print(segment)
 		# print(min_dropped_segments)
