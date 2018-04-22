@@ -1,4 +1,6 @@
 import os, shutil
+import re
+import zhon.hanzi
 from pdf2image import convert_from_path
 import pytesseract
 import numpy as np
@@ -6,262 +8,381 @@ import cv2
 import matplotlib.pyplot as plt
 from PIL import Image
 from Tools import Tools
+import editdistance
+import json
 
-class ImageConverter():
-	def __init__(self, img_path, output_folder):
-		if not os.path.isfile(img_path):
-			raise FileNotFoundError("%s is not a file" % (img_path))
+from pdfminer.pdfinterp import PDFResourceManager, process_pdf
+from pdfminer.converter import TextConverter
+from pdfminer.layout import LAParams
+from io import StringIO
+from io import open
 
-		self.segments = None
-		self.rectangles = None
-		self.img = cv2.imread(img_path)
-		self.output_folder = output_folder
-		self.HSV = cv2.cvtColor(self.img, cv2.COLOR_BGR2HSV)
-		self.H, self.S, self.V = cv2.split(self.HSV)
 
+
+class ResumeLine():
+
+	TITLE = 0
+	CONTENT = 1
+
+	def __init__(self, bound, _type=CONTENT, lineno=-1):
+		self.bound = bound
+		self._type = _type
+		self.lineno = lineno
+		self.image_hsv = None
+		self.image_gray = None
+		self.text = None
+		self.content = []
+		self.is_end = True
+
+	@property
+	def bound(self):
+		return self.__bound
+
+	@bound.setter
+	def bound(self, new_bound):
+		self.__bound = {"left":0, "top":0,"right":-1,"bottom":-1}
+		self.__bound.update(new_bound)
+
+	def update_bound(self, new_bound):
+		self.__bound.update(new_bound)
+
+	def get_image(self, hsv):
+		self.image_hsv = hsv[self.bound["top"] : self.bound["bottom"],
+							self.bound["left"] : self.bound["right"]]
+		return self.image_hsv
+
+	def is_title(self):
+		return self._type == ResumeLine.TITLE
+
+	def __OCR_preprocess__(self):
+		bgr = cv2.cvtColor(self.image_hsv, cv2.COLOR_HSV2BGR)
+		image_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+		# reverse color and binaryzation 
+		aver = np.mean(image_gray)
+		is_white = (image_gray.astype('int') - int(aver) > 0).astype(int)
+
+		# background color should be white
+		if np.sum(is_white[4, 0:30]) >= 15:
+			image_gray = (is_white * 255).astype("uint8")
+		else:
+			image_gray = ((1 - is_white) * 255).astype("uint8")
+
+		self.image_gray = image_gray
+		return image_gray
+
+	def detect_text(self):
+		if self.image_hsv is None:
+			raise ValueError("No Images Available")
+		image_gray = self.__OCR_preprocess__()
+		self.text = pytesseract.image_to_string(image_gray, lang="chi_sim")
+
+		rgb = cv2.cvtColor(self.image_hsv, cv2.COLOR_HSV2BGR)
+		
+		if self.is_title():
+			self.text = re.sub("[^\u4E00-\u9FA5]","", self.text)
+		else:
+			self.text = re.sub("[ \n]+","", self.text)
+			pass
+			# raise NotImplementedError("non-title text postprocessing not implemented")
+		return self.text
+
+	def correct_text_by(self, texts):
+		texts = np.array(texts)
+		distances = np.array([editdistance.eval(text, self.text) for text in texts])
+		self.text = min(texts[distances == distances.min()], 
+							key=lambda text : abs(len(text) - len(self.text)))
+		return self.text
+
+class ResumeImageSpliter():
+
+	# constants
+	OPTIMIZE_OFF = 0
+	OPTIMIZE_ON = 1
+
+	def __init__(self, image):
+		self.image_ori = image
+		self.resume_lines = []
+		self.image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+
+	def preprocess(self, processes=["clear_tableline","sharpen"]):
+		img = None
+		for process in processes:
+			if hasattr(self, process):
+				img = getattr(self, process)()
+			else:
+				raise ValueError("preprocess %s not defined" % process)
+		return img
+
+	def split_by_color(self, mode=OPTIMIZE_ON):
+		COLOR_WHITE, COLOR_BLACK, COLOR_OTHER = (2, 1, 0)
+		h,s,v = cv2.split(self.image)
+		width = h.shape[1]
+
+		# scan every line
+		cnt = 1
+		start = -1
+		cur_color = COLOR_WHITE
+		line_color = None
+		for _index, (line_h, line_v) in enumerate(zip(h, v)):
+			# WHITE: (0, 0, 255)     1   1
+			# BLACK: (0, 0, 0)       1   0
+			# OTHER: (180, 100, 100) 0   1 / 0   0 
+			line_color = int((line_h == 0).all()) * (int((line_v != 0).all()) + 1)
+			# for test use
+			# if line_color == COLOR_WHITE:
+				# s_ = "white"
+			# if line_color == COLOR_BLACK:
+				# s_ = "black"
+			# if line_color == COLOR_OTHER:
+				# s_ = "other"
+			# print(s_)
+			# print((line_h == 0).all(), (line_v != 0).all())
+			# line is still going on
+			if cur_color == line_color:
+				continue
+			# line meets its end
+			elif line_color == COLOR_WHITE:
+				_type = None
+				# a title line meets its end
+				if cur_color == COLOR_OTHER:
+					_type = ResumeLine.TITLE
+				else:
+					_type = ResumeLine.CONTENT
+				# print(start, _index, _type == ResumeLine.TITLE)
+				cur_color = COLOR_WHITE
+
+				resume_line = ResumeLine(bound={"top":start, "bottom": _index}, _type=_type)
+				resume_line.image_hsv = self.image[start : _index, :]
+				self.resume_lines.append(resume_line)
+				
+			# a new line start (if line_color != COLOR_WHITE)
+			else:
+				if cur_color != COLOR_WHITE:
+					continue
+				cur_color = line_color
+				start = _index
+		
+		return self.resume_lines
+		
+
+	def mark_titles(self):
+		for resume_line in self.resume_lines:
+			bound = resume_line.bound
+			cv2.rectangle(self.image_ori, (bound["left"], bound["top"]), (bound["right"], bound["bottom"]), (0x0,0x0,0xFF), 2)
+		return self.image_ori
 
 	def sharpen(self):
-		S = (self.S.astype(int) - 100) > 0
-		V = (self.V.astype(int) - 100) > 0
+		h,s,v = cv2.split(self.image)
 
-		self.H = (self.H * (S.astype("uint8")))
-		self.S = (S.astype(int) * 255).astype("uint8")
-		self.V = (V.astype(int) * 255).astype("uint8")
-		self.HSV = cv2.merge((self.H, self.S, self.V))
-		return self.HSV
+		s_boolean = (s.astype(int) - 100) > 0
+		v_boolean = (v.astype(int) - 100) > 0
 
-	# 超参数step，多少个连在一起的像素同时为深色时，算是表格的一部分？
+		h = (h * (s_boolean.astype("uint8")))
+		s = (s_boolean.astype(int) * 255).astype("uint8")
+		v = (v_boolean.astype(int) * 255).astype("uint8")
+
+		self.image = cv2.merge((h, s, v))
+		return self.image
+
 	def clear_tableline(self):
 		rows = []
 		columns = []
-		step = (int)(self.img.shape[1] / 4)
+		step = (int)(self.image.shape[1] / 4)
 
-		V = (self.V.astype(int) - 200) < 0
-		for index, row in enumerate(V):
+		h,s,v = cv2.split(self.image)
+		v = (v.astype(int) - 200) < 0
+		for index, row in enumerate(v):
 			for i in range(0, 4):
 				if np.sum(row[i * step:(i + 1) * step]) == step:
 					rows.append(index)
 
-		for index, column in enumerate(np.transpose(V)):
+		for index, column in enumerate(np.transpose(v)):
 			for i in range(0, 4):
 				if np.sum(column[i * step : (i + 1) * step]) == step:
 					columns.append(index)
 
-		# print rows and columns to see what has been cleared
-		# print("rows = " + str(rows))
-		# print("columns = " + str(columns))
 		for row in rows:
-			self.HSV[row,:] = [0,0,255]
+			self.image[row,:] = [0,0,255]
 
 		for column in columns:
-			self.HSV[:,column] = [0,0,255]
+			self.image[:,column] = [0,0,255]
 
-		self.H, self.S, self.V = cv2.split(self.HSV)
-		return self.HSV
-
-	def get_segments(self):
-		raise NotImplementedError()
-
-	def mark_titles(self):
-		width = self.HSV.shape[1]
-		self.rectangles = []
-		for segment in self.segments:
-			left_bound = right_bound = -1
-
-			
-			stds = [np.std(self.S[segment[0]:segment[1],i]) for i in range(width)]
-			aver_std = np.mean([std for std in stds if std > 1])
-
-			for i in range(0, width):
-				if left_bound == -1 and np.std(self.S[segment[0]:segment[1],i]) > aver_std * 0.3:
-					left_bound = i
-				if right_bound == -1 and np.std(self.S[segment[0]:segment[1],width - i - 1]) > aver_std * 0.3:
-					right_bound = width - i - 1
-				if left_bound != -1 and right_bound != -1:
-					break
-			self.rectangles.append((segment[0], left_bound, segment[1], right_bound))
-
-		base_index = len(os.listdir(self.output_folder))
-		title_imgs = []
-
-		rectangle_widths = [rectangle[3] - rectangle[1] for rectangle in self.rectangles]
-		aver_width = (np.sum(rectangle_widths) - np.max(rectangle_widths) - np.min(rectangle_widths)) / (len(rectangle_widths) - 2)
-		max_width = aver_width * 3
-		min_width = aver_width / 3
-		self.rectangles = [rectangle for rectangle in self.rectangles if (rectangle[3] - rectangle[1]) > min_width and (rectangle[3] - rectangle[1]) < max_width]
-
-		for index, rectangle in enumerate(self.rectangles):
-			# hsv_img = self.HSV[rectangle[0]:rectangle[2], rectangle[1]:rectangle[3]]
-			# rgb_img = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2RGB)
-
-			hsv_img = self.standarize_word_img(self.HSV[rectangle[0]:rectangle[2], rectangle[1]:rectangle[3]])
-			rgb_img = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2RGB)
-			cv2.imwrite(os.path.join(self.output_folder, "%d.jpg" % (base_index + index + 1)), rgb_img)
-			# grayscale_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2GRAY)
-			title_imgs.append(cv2.cvtColor(rgb_img, cv2.COLOR_BGR2GRAY))
-			# cv2.imwrite(os.path.join(self.output_folder, "%d.jpg" % (base_index + index + 1)), grayscale_img)
-			# print(rectangle)
-			cv2.rectangle(self.HSV, (rectangle[1], rectangle[0]), (rectangle[3], rectangle[2]), (0x0,0xFF,0xFF), 1)
-
-		for title_img in title_imgs:
-			print(pytesseract.image_to_string(title_img, lang="chi_sim"))
-
-		return self.HSV
-
-	def standarize_word_img(self, hsv):
-		bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-		gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-		bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-		hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-
-		h,s,v = cv2.split(hsv)
-		# Reverse color and binaryzation 
-		aver = np.mean(v)
-		v_bg = (v.astype('int') - int(aver) > 0).astype(int)
-
-		if np.sum(v_bg[0:4,0:4].astype(int)) <= 4:
-			v = ((1 - v_bg) * 255).astype("uint8")
-		else:
-			v = (v_bg * 255).astype("uint8")
-
-		hsv = cv2.merge((h,s,v))
-
-		# reserved code for optimization
-		# column segments
-		# segments = []
-		# start = -1
-		# for index, column in enumerate(np.transpose(v)):
-		# 	# print(column)
-		# 	is_blank = (column == 255).all()
-		# 	if start == -1 and not is_blank:
-		# 		start = index
-		# 	elif start != -1 and is_blank:
-		# 		segments.append((start, index))
-		# 		start = -1
-		
-		# if start != -1:
-		# 	segments.append((start,v.shape[1]))
-
-		# widths = np.array([(segment[1] - segment[0]) for segment in segments])
-		# widths = widths[abs(widths - np.mean(widths)) < 2 * np.std(widths)]
-		# dropped_segments = [segment for segment in segments if (segment[1] - segment[0]) not in widths]
-		# for segment in dropped_segments:
-		# 	hsv[:, segment[0]:segment[1]] = [0,0,255]			
-
-		return hsv
+		return self.image
 
 
 
-
-class ColorBasedConverter(ImageConverter):
-	def __init__(self, img_path, output_folder):
-		ImageConverter.__init__(self, img_path, output_folder)
-
-	def __get_segments__(self):
-		start = -1
-		cnt = 1
-		segments = []
-		for index,line in enumerate(self.H):
-			is_blank = (line == 0).all()
-			if (start == -1) and (not is_blank):
-				start = index
-			elif (start != -1) and (is_blank):
-				segments.append((start, index, index - 1 - start, cnt))
-				cnt += 1
-				start = -1
-
-		if len(segments) <= 2:
-			raise ValueError("Image cannot be converted through color features")
-
-		segment_heights = [segment[2] for segment in segments]
-		counts = np.bincount(segment_heights)
-		mode = np.argmax(counts)
-		if np.max(counts) >= int(0.6 * (len(segment_heights))):
-			segments = [segment for segment in segments if segment[2] == mode]
-			return (True, segments, self.HSV)
-
-		aver_height = (np.sum(segment_heights) - np.max(segment_heights) - np.min(segment_heights)) / (len(segment_heights) - 2)
-		max_height = aver_height * 3
-		min_height = aver_height / 3
-		min_height_dropped_segments = [segment for segment in segments if segment[2] < min_height]
-		max_height_dropped_segments = [segment for segment in segments if segment[2] > max_height]
-		
-		# print to see segments you have
-		# for segment in segments:
-			# print(segment)
-		# print(min_dropped_segments)
-		# print(max_dropped_segments)
-		max_dropped_segments = [segment for segment in segments if segment[2] >= max_height]
-		min_dropped_segments = [segment for segment in segments if segment[2] <= min_height]
-		segments = [segment for segment in segments if segment[2] <= max_height and segment[2] >= min_height]
-
-		self.std_height = np.mean([segment[2] for segment in segments])
-
-		for segment in min_height_dropped_segments:
-			self.HSV[segment[0]:segment[1],:] = [0,0,255]
-
-		# reserved code for inline image elimination
-		# for segment in max_dropped_segments:
-		# 	status = 0
-		# 	bounds = []
-		# 	for row in range(self.HSV.shape[1] - 1, 0, -1):
-		# 		is_blank = (np.count_nonzero(self.H[segment[0]:segment[1], row]) < max_height)
-		# 		if status == 0 and not is_blank:
-		# 			status = row
-		# 		elif status != 0 and is_blank:
-		# 			bounds.append((row, status))
-		# 			status = 0
-		# 	for bound in bounds:
-		# 		self.HSV[segment[0]:segment[1],bound[0]:bound[1]] = [0,0,255]
-
-		self.H, self.S, self.V = cv2.split(self.HSV)
-		return ((len(min_dropped_segments) == len(min_dropped_segments) == 0), segments, self.HSV)
-
-	def get_segments(self):
-		done = False
-		while not done:
-			done, self.segments, HSV = self.__get_segments__()
-		return (self.segments, HSV)
-
-class FontBasedConverter(ImageConverter):
-	def __init__(self, img_path, output_folder):
-		ImageConverter.__init__(self, img_path, output_folder)
-
-	def get_segments(self):
-		raise NotImplementedError()
-
-
-
-class PDF2XML():
-	def __init__(self, pdf_path):
+class Resume():
+	def __init__(self, pdf_path, **kwargs):
 		if not os.path.isfile(pdf_path):
 			raise FileNotFoundError("%s is not a file" % (pdf_path))
+		
+		self.resume_lines = []
 		self.pdf_path = pdf_path
-		self.__setpaths__()
+		self.pdf_name, _ = os.path.splitext(os.path.basename(self.pdf_path))
+		self.workspaces = \
+		{
+			"pdf_images"  	: ".\\workspace\\%s\\pdf_images" % (self.pdf_name),
+			"word_images" 	: ".\\workspace\\%s\\itermediates\\word_images" % (self.pdf_name),
+			"dealed_images"	: ".\\workspace\\%s\\itermediates\\dealed_images" % (self.pdf_name),
+			"result" 	  	: ".\\workspace\\%s\\result" % (self.pdf_name),
+			"log"			: ".\\workspace\\%s\\log" % (self.pdf_name)
+		}
+
+		for workspace in self.workspaces.values():
+			os.makedirs(workspace, exist_ok=True)
+			Tools.cleanfolder(workspace)
+		
+		self.__pdf2txt__()
 		self.__pdf2image__()
-	
-	def __setpaths__(self):
-		self.pdf_name, ext = os.path.splitext(os.path.basename(self.pdf_path))
-		self.work_dirs = {}
-		self.work_dirs["pdf_images_dir"] = ".\\%s\\images\\pdf_images" % (self.pdf_name)
-		self.work_dirs["words_images_dir"] = ".\\%s\\images\\words_images" % (self.pdf_name)
-		for name in self.work_dirs:
-			os.makedirs(self.work_dirs[name], exist_ok=True)	
-			Tools.cleanfolder(self.work_dirs[name])
+		self.resume_lines = []
 
 	def __pdf2image__(self):
-		convert_from_path(self.pdf_path, output_folder=self.work_dirs["pdf_images_dir"], fmt="jpg")
-		for index, imagename in enumerate(os.listdir(self.work_dirs["pdf_images_dir"])):
-			os.rename(os.path.join(self.work_dirs["pdf_images_dir"], imagename), 
-				os.path.join(self.work_dirs["pdf_images_dir"], "%d.jpg" % (index + 1)))
+		convert_from_path(self.pdf_path, output_folder=self.workspaces["pdf_images"], fmt="jpg")
+		for _index, imagename in enumerate(os.listdir(self.workspaces["pdf_images"])):
+			os.rename(os.path.join(self.workspaces["pdf_images"], imagename), 
+				os.path.join(self.workspaces["pdf_images"], "%d.jpg" % _index))
+
+
+	def __pdf2txt__(self):
+		txt = self.__readPDF__(open(self.pdf_path, 'rb'))
+		self.pdf_txts = [t for t in re.sub("[ \t]+"," ",txt).split('\n') if len(t) > 0]
+		self.pdf_txts_guarantee = [t for t in re.sub("[^%s\n\da-zA-Z]" % zhon.hanzi.characters,"", txt).split('\n') if len(t) > 0]
+		self.pdf_title_candidates = [t for t in re.sub("[^%s\n\da-zA-Z]" % zhon.hanzi.characters,"", txt).split('\n') if len(t) > 0 and len(t) < 10]
+		# print(txt)
+		# print()
+		# for t in self.pdf_txts:
+			# print(t)
+
+	def __readPDF__(self, pdf_file):
+	    rsrcmgr = PDFResourceManager()
+	    retstr = StringIO()
+	    laparams = LAParams()
+	    device = TextConverter(rsrcmgr, retstr, laparams=laparams)
+
+	    process_pdf(rsrcmgr, device, pdf_file)
+	    device.close()
+
+	    content = retstr.getvalue()
+	    retstr.close()
+	    return content
+
+	def get_title_lines(self):
+		return [resume_line for resume_line in self.resume_lines if resume_line.is_title()]
+
+
+	def get_line_bounds(self):
+
+		for _index, resume_line in enumerate(self.resume_lines):
+			# if not resume_line.is_title():
+				# continue
+			resume_line.lineno = _index
+			h, s, v = cv2.split(resume_line.image_hsv)
+			width = resume_line.image_hsv.shape[1]
+
+			feature = s if resume_line.is_title() else v
+			stds = np.array([np.std(feature[:, _]) for _ in range(width)])
+
+			aver_std = np.mean(stds[stds > 1])
+
+			left_bound = np.argmax(stds > aver_std * 0.3)
+			right_bound = width - np.argmax(stds[::-1] > aver_std * 0.3)
+			resume_line.update_bound({"left":left_bound, "right":right_bound})
+			bound = resume_line.bound 
+			resume_line.image_hsv = resume_line.image_hsv[:,bound["left"]:bound["right"]]
+		
+		return self.resume_lines
+	
+	def detect_titles(self, correct_by=None):
+		resume_lines = self.get_title_lines()
+
+		for resume_line in resume_lines:
+			resume_line.detect_text()
+			if correct_by is not None:
+				resume_line.correct_text_by(correct_by)
+
+		return [resume_line.text for resume_line in resume_lines]
+
+	def execute(self, view_words=False, mark_titles=False):
+		self.spliters = []
+		self.resume_lines = []
+
+		for _index, image_file in enumerate(os.listdir(self.workspaces["pdf_images"])):
+			image = cv2.imread(os.path.join(self.workspaces['pdf_images'], image_file))
+			spliter = ResumeImageSpliter(image)
+			spliter.preprocess()
+			spliter.split_by_color()
+			self.resume_lines.extend(spliter.resume_lines)
+
+		self.resume_lines = Tools.drop_outlets(self.resume_lines, 
+							key=lambda line : (line.bound["bottom"] - line.bound["top"]))
+
+		self.get_line_bounds()
+		self.detect_titles(correct_by=self.pdf_title_candidates)
+		self.detect_horizontal_bound()
+		# if mark_titles:
+		# 	image = spliter.mark_titles()
+		# 	cv2.imwrite(os.path.join(self.workspaces["dealed_images"], "%d.jpg" % _index), image)
+		
+		# if view_words:
+		# 	for resume_line in spliter.get_title_lines():
+		# 		cv2.imwrite(os.path.join(self.workspaces["word_images"], "%s.jpg" % resume_line.text), resume_line.image_gray)
+
+		# self.spliters.append(spliter)
+		# self.resume_lines.extend(spliter.resume_lines)
+
+	def get_titles(self):
+		return [resume_line.text for resume_line in self.resume_lines if resume_line.is_title()]
+
+
+	def detect_horizontal_bound(self):
+		bounds = [resume_line.bound for resume_line in self.resume_lines]
+		self.horizontal_bound = {
+			"left": max(bounds, key=lambda bound : bound["left"])["left"],
+			"right": max(bounds, key=lambda bound : bound["right"])["right"]
+		}
+		# print("horizontal_bound = %d" % self.horizontal_bound["right"])
+		return self.horizontal_bound
+
+
+	def reform_json(self):
+		self.struct = {}
+		cur_title = None
+		is_end = True
+		_index = -1
+
+		for resume_line in self.resume_lines:
+			if resume_line.is_title():
+				
+				new_index = self.pdf_txts_guarantee.index(resume_line.text)
+				if _index < new_index - 1 and _index != -1:
+					for i in range(_index + 1, new_index):
+						self.struct[cur_title][-1] += " " + self.pdf_txts[i]
+
+				_index = new_index
+				cur_title = resume_line.text
+				self.struct[cur_title] = []	
+
+			else:
+				if cur_title is None:
+					continue
+				_index += 1
+				if not is_end and re.search("^\d", self.pdf_txts[_index]) is None and len(self.struct[cur_title]) != 0:
+					self.struct[cur_title][-1] += self.pdf_txts[_index].strip()
+				else:
+					self.struct[cur_title].append(self.pdf_txts[_index].strip())
+				
+				if np.isclose(self.horizontal_bound["right"], resume_line.bound["right"], rtol=0.05):
+					is_end = False
+				else:
+					is_end = True
+		return self.struct
+
 
 if __name__ == '__main__':
-	dealer = ColorBasedConverter(".\\pictures\\1.jpg", ".\\XM\\images\\words_images")
-
-	HSV = dealer.clear_tableline()
-	HSV = dealer.sharpen()
-	segments, HSV = dealer.get_segments()
-	HSV = dealer.mark_titles()
-
-	img = cv2.cvtColor(HSV, cv2.COLOR_HSV2BGR)
-	cv2.imwrite("result1.jpg", img)
+	resume = Resume(".\\XM.pdf")
+	resume.execute(view_words=True, mark_titles=True)
+	# d = resume.make_json()
+	print(json.dumps(resume.reform_json(), indent=4, sort_keys=False, ensure_ascii=False))
+	
